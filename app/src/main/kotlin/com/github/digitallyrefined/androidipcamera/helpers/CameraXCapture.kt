@@ -41,11 +41,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * Global/modern backend (CameraX). The live stream is fed from ImageAnalysis (YUV → encoder) — it
- * reliably honours the requested resolution (Preview-to-a-custom-Surface picks tiny sizes on some
- * legacy HALs, and Preview is screen-capped anyway). Full-res stills come from ImageCapture
- * (co-bound so no per-shot rebind); if the HAL never completes a takePicture, the freshest analysis
- * frame is encoded as a guaranteed fallback. Some HALs fail to configure any session containing a
+ * Global/modern backend (CameraX). H.264 can use an encoder Preview surface; ImageAnalysis feeds
+ * CPU encoders and motion detection. Optional display Preview and ImageCapture are reduced before
+ * sacrificing the encoder surface. Full-res stills use ImageCapture when co-bound (no per-shot
+ * rebind); otherwise, or if takePicture stalls, a fresh analysis frame supplies a snapshot.
+ * Some HALs fail to configure any session containing a
  * still surface ("Unable to configure camera ... TimeoutException") — that wedge is detected by the
  * service via [hasProducedFrame] and it falls back to the Camera1 backend.
  * On a strong CPU this runs at the camera's frame rate; on weak/legacy chips the YUV→NV12 copy is
@@ -63,6 +63,7 @@ class CameraXCapture(
     private val previewSurfaceProvider: Preview.SurfaceProvider? = null,
     private val encoderSurfaceProvider: Preview.SurfaceProvider? = null,
     private val onEncoderSurfaceFallback: (() -> Unit)? = null,
+    private val onDisplayPreviewFallback: (() -> Unit)? = null,
     private val onFrame: (ImageProxy) -> Unit
 ) : CaptureBackend {
     @Volatile override var width = desired.width; private set
@@ -79,7 +80,7 @@ class CameraXCapture(
     private var appliedAeRange: Range<Int>? = null
     @Volatile private var negotiatedPreviewFps = false
     private var imageCapture: ImageCapture? = null
-    // Always co-bound with the stream so a still snaps straight from the bound use case (no rebind).
+    // Co-bound when supported; otherwise snapshots use the analysis frame cache.
     private var boundSelector: CameraSelector? = null
     private var analysisUseCase: ImageAnalysis? = null
     private var previewUseCase: Preview? = null
@@ -184,7 +185,7 @@ class CameraXCapture(
                         } catch (e: Exception) { Log.e(TAG, "frame cache: ${e.message}") }
                         onFrame(img)
                     } }
-                // ImageCapture stays co-bound from start(): a still then snaps straight from the bound
+                // Prefer keeping ImageCapture co-bound: a still then snaps straight from the bound
                 // use case, avoiding the per-shot unbind/rebind that hangs the session configuration on
                 // some HALs. MINIMIZE_LATENCY captures from the repeating stream instead of asking the
                 // HAL to reconfigure the session for a full-sensor still surface.
@@ -218,71 +219,52 @@ class CameraXCapture(
         }, main)
     }
 
-    /** (Re)bind the streaming use cases on the main thread. ImageCapture is always co-bound so a still
-     *  can snap directly from the already-bound use case — never a per-shot unbind/rebind cycle (which
-     *  hangs the session configuration on some HALs). */
+    /** Bind supported combinations without sacrificing the encoder for optional display/still work. */
     private fun rebind() {
         if (released) return
         val p = provider ?: return
         val sel = boundSelector ?: return
         val analysis = analysisUseCase ?: return
-        val cases = mutableListOf<androidx.camera.core.UseCase>()
-        previewUseCase?.let { cases.add(it) }
-        encoderUseCase?.let { cases.add(it) }
-        cases.add(analysis)
-        imageCapture?.let { cases.add(it) }
-        p.unbindAll()
-        // On slow HALs (e.g. Exynos 7420) the previous camera close() can take 400ms–6s.
-        // bindToLifecycle() may fail if the HAL hasn't finished tearing down. Retry a few
-        // times before falling back to degraded surface combinations.
-        val maxRetries = 3
-        var lastException: Exception? = null
-        for (attempt in 1..maxRetries) {
-            try {
-                camera = p.bindToLifecycle(owner, sel, *cases.toTypedArray())
-                encoderSurfaceBound = encoderUseCase != null && cases.any { it === encoderUseCase }
-                lastException = null
-                break
-            } catch (e: Exception) {
-                lastException = e
-                if (attempt < maxRetries) {
-                    Log.w(TAG, "bindToLifecycle failed (attempt $attempt/$maxRetries): ${e.message}; retrying in 500ms...")
+        val candidates = CameraXBindingPolicy.candidates(
+            previewUseCase != null, encoderUseCase != null, imageCapture != null
+        )
+        encoderSurfaceBound = false
+        val (selected, boundCamera) = CameraXBindingPolicy.bind(candidates) { candidate ->
+            val cases = mutableListOf<androidx.camera.core.UseCase>(analysis)
+            if (candidate.display) previewUseCase?.let { cases.add(it) }
+            if (candidate.encoder) encoderUseCase?.let { cases.add(it) }
+            if (candidate.still) imageCapture?.let { cases.add(it) }
+            // Preserve the existing close/teardown retries for the initially requested combination.
+            // Reduced combinations are attempted once each, with no per-shot rebinds.
+            val attempts = if (candidate == candidates.first()) 3 else 1
+            var result: androidx.camera.core.Camera? = null
+            for (attempt in 1..attempts) {
+                try {
+                    p.unbindAll()
+                    result = p.bindToLifecycle(owner, sel, *cases.toTypedArray())
+                    break
+                } catch (e: Exception) {
+                    Log.w(TAG, "bind $candidate failed ($attempt/$attempts): ${e.message}")
+                    if (attempt == attempts) throw e
                     Thread.sleep(500)
-                } else {
-                    Log.e(TAG, "bindToLifecycle failed after $maxRetries attempts: ${e.message}")
                 }
             }
+            checkNotNull(result)
         }
-        if (lastException != null) {
-            // Co-binding the encoder surface with a still stream can exceed some HALs' concurrent-stream
-            // limit. Rather than lose the camera, shed the encoder surface / screen preview and keep
-            // ImageAnalysis + ImageCapture (software YUV stream, full-res stills intact).
-            if (encoderUseCase != null || previewUseCase != null) {
-                Log.w(TAG, "Attempting fallback: dropping encoder surface / preview...")
-                try {
-                    encoderUseCase = null
-                    previewUseCase = null
-                    encoderSurfaceBound = false
-                    p.unbindAll()
-                    camera = p.bindToLifecycle(owner, sel, analysis, imageCapture ?: throw RuntimeException("ImageCapture not initialized"))
-                    onEncoderSurfaceFallback?.invoke()
-                } catch (e: Exception) {
-                    Log.e(TAG, "fallback rebind failed: ${e.message}")
-                    throw e
-                }
-            } else {
-                // Last resort: a lone ImageCapture should always be bindable.
-                Log.w(TAG, "Attempting fallback: binding ImageCapture alone...")
-                try {
-                    p.unbindAll()
-                    camera = p.bindToLifecycle(owner, sel, imageCapture ?: throw RuntimeException("ImageCapture not initialized"))
-                    encoderSurfaceBound = false
-                } catch (e: Exception) {
-                    Log.e(TAG, "ImageCapture-alone rebind failed: ${e.message}")
-                    throw e
-                }
-            }
+        camera = boundCamera
+        encoderSurfaceBound = selected.encoder
+        // Notify only after a reduced session has actually bound. Keeping the surface must never
+        // clear the service's surface encoder (which would switch analysis to CPU-fed encoding).
+        if (encoderUseCase != null && !selected.encoder) {
+            encoderUseCase = null
+            onEncoderSurfaceFallback?.invoke()
         }
+        if (previewUseCase != null && !selected.display) {
+            previewUseCase = null
+            onDisplayPreviewFallback?.invoke()
+        }
+        if (!selected.still) imageCapture = null
+        Log.i(TAG, "bound use cases: $selected; analysis=true; snapshots=${if (selected.still) "ImageCapture" else "analysis cache"}")
         configureFps(hasAnalysis = p.isBound(analysis))
         // Re-apply cached controls, since rebinding replaces the camera control.
         val cc = camera?.cameraControl
@@ -324,9 +306,9 @@ class CameraXCapture(
     }
 
     override fun captureStill(onJpeg: (ByteArray?) -> Unit) {
-        val ic = imageCapture ?: return onJpeg(null)
         if (provider == null || released) return onJpeg(null)
-        // ImageCapture stays bound from start(), so a still needs no rebind — per-shot unbind/rebind
+        val ic = imageCapture ?: return onJpeg(frameFallbackJpeg())
+        // When retained, ImageCapture stays bound, so a still needs no rebind — per-shot unbind/rebind
         // cycles hang the session configuration on some HALs. Just snap from the bound use case.
         main.execute {
             if (released) return@execute onJpeg(null)
@@ -569,6 +551,7 @@ class CameraXCapture(
 
     override fun stop() {
         ready = false
+        encoderSurfaceBound = false
         released = true               // block any in-flight capture callback from touching the camera
         mainHandler.removeCallbacksAndMessages(null)
         try { provider?.unbindAll() } catch (_: Exception) {}

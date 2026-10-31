@@ -47,4 +47,5 @@
         <item>30</item>
     </string-array>
     <string name="streaming_active">🔴 Streaming active</string>
+    <string name="camera_preview_unavailable">On-phone preview unavailable for this camera configuration. Capture continues.</string>
 </resources>
