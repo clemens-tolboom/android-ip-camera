@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+case "${1:-}" in
+  debug|release) TARGET="$1" ;;
+  *)
+    echo "usage: $0 <debug|release> [gradle args...]" >&2
+    echo "  when workers die use : $0 debug -Dorg.gradle.jvmargs=-Xmx1536m --max-workers=2 -Dorg.gradle.parallel=false" >&2
+    echo "  still dying?         : $0 debug -Dorg.gradle.jvmargs=-Xmx1280m -Pkotlin.daemon.jvmargs=-Xmx1024m --max-workers=1 -Dorg.gradle.parallel=false --no-daemon" >&2
+    echo "  note: keep the Podman VM at 4096 MiB; this host has 8 GB RAM" >&2
+    exit 1
+    ;;
+esac
+shift
+
+# Google's Linux AAPT2 / SDK build-tools are x86_64-only, so on Apple Silicon
+# the container must be amd64 (run under QEMU) rather than arm64.
+PLATFORM="${PLATFORM:-linux/amd64}"
+
+if docker info >/dev/null 2>&1; then
+  ENGINE=docker
+elif podman info >/dev/null 2>&1; then
+  ENGINE=podman
+  podman machine stop
+  podman machine set --memory 4096
+  podman machine start
+else
+  echo "error: neither docker nor podman is available/running" >&2
+  exit 1
+fi
+
+printf '****** IMAGE BUILD ******\n\n'
+
+"$ENGINE" build --platform "$PLATFORM" -t android-ip-camera:builder .
+
+printf "****** FILLING CACHE ******\n\n"
+
+mkdir -p .cache/android-sdk .cache/gradle
+"$ENGINE" run --platform "$PLATFORM" --rm \
+  -v "$PWD/.cache/android-sdk":/cache/sdk \
+  android-ip-camera:builder \
+  sh -lc 'yes | sdkmanager --sdk_root=/cache/sdk --licenses >/dev/null \
+          && sdkmanager --sdk_root=/cache/sdk --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" >/dev/null'
+
+printf '****** APK BUILD ******\n\n'
+
+"$ENGINE" run --platform "$PLATFORM" --rm \
+  -v "$PWD":/workspace \
+  -v "$PWD/.cache/gradle":/cache/gradle \
+  -v "$PWD/.cache/android-sdk":/opt/android-sdk \
+  android-ip-camera:builder "$TARGET" "$@"
