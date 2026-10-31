@@ -30,10 +30,10 @@ import androidx.lifecycle.lifecycleScope
 import androidx.preference.PreferenceManager
 import com.github.digitallyrefined.androidipcamera.helpers.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -111,8 +111,8 @@ class StreamingService : LifecycleService() {
     private data class CachedSnapshot(val jpeg: ByteArray, val atMs: Long)
     private val snapCache = ConcurrentHashMap<String, CachedSnapshot>()
     private val snapLock = Any()
-    private val cameraMutex = Mutex()
-    private var pendingStartJob: kotlinx.coroutines.Job? = null
+    private val cameraSession by lazy { CameraSessionLifecycle(lifecycleScope) }
+    private val deferredRecordingControls = linkedMapOf<String, String>()
     private var torchVerifyJob: kotlinx.coroutines.Job? = null
     @Volatile private var cameraCloseStartTime: Long = 0L
 
@@ -241,7 +241,7 @@ class StreamingService : LifecycleService() {
         // The service is going away, so the torch has nothing left to keep the camera open for;
         // clearing this first stops the guard in stopCamera() from leaking the session.
         cameraHeldForTorch = false
-        stopCamera()
+        stopCamera(shutdown = true)
         // A setTorchMode torch outlives the process — release it explicitly or the LED burns
         // forever after the service is stopped.
         if (deviceTorchOn) setDeviceTorch(false)
@@ -283,7 +283,7 @@ class StreamingService : LifecycleService() {
         currentSurfaceProvider = surfaceProvider
         // Recording owns the camera session: stopping or restarting the camera now would tear
         // down the encoder and finalize the file, so leave the pipeline alone until it stops.
-        if (localRecorder?.isRecording == true) return
+        if (cameraSession.recordingOwnsSession) return
         val shouldRun = encoders.any { it.hasClients() } || currentSurfaceProvider != null || motionEnabled()
         if (shouldRun) {
             debouncedStartCamera()
@@ -296,13 +296,7 @@ class StreamingService : LifecycleService() {
     }
     fun isCameraRunning() = captureRunning
     fun hasActiveClients() = encoders.any { it.hasClients() } || localRecorder?.isRecording == true || motionEnabled()
-    fun switchCamera() {
-        selectCamera(!frontFacing, null)
-        PreferenceManager.getDefaultSharedPreferences(this).edit()
-            .putString(PREF_CAMERA_ID, camId())
-            .apply()
-        if (captureRunning) debouncedStartCamera(force = true)
-    }
+    fun switchCamera() { handleRemoteControl("camera", if (frontFacing) "back" else "front") }
 
     fun getLocalIpAddress(): String {
         // A server limited to one interface should advertise that address, not whichever IPv4
@@ -509,7 +503,7 @@ class StreamingService : LifecycleService() {
             // While recording, the camera is already running and feeding the encoder; a
             // restart would finalize the recording, and new viewers pick up the existing
             // stream, so no reconfiguration is needed (the sub stream encoder needs no restart).
-            if (localRecorder?.isRecording == true) {
+            if (cameraSession.recordingOwnsSession) {
                 updateSubStream()
                 return@launchMain
             }
@@ -526,7 +520,7 @@ class StreamingService : LifecycleService() {
             onClientDisconnected?.invoke()
             // Recording owns the camera: stopping or restarting it now would finalize
             // the file, and remaining viewers keep their existing stream as-is.
-            if (localRecorder?.isRecording == true) {
+            if (cameraSession.recordingOwnsSession) {
                 updateSubStream()
                 return@launchMain
             }
@@ -539,12 +533,10 @@ class StreamingService : LifecycleService() {
                     // surface encoder / GL pipe and keep the camera warm in a plain,
                     // snapshot-friendly configuration. Force ignores the hasClients()
                     // bypass so the reconfiguration actually happens.
-                    pendingStartJob?.cancel()
-                    pendingStartJob = lifecycleScope.launch(Dispatchers.Main) {
-                        kotlinx.coroutines.delay(300)
-                        if (!captureRunning) return@launch   // camera stopped meanwhile
-                        if (encoders.any { it.hasClients() } || currentSurfaceProvider != null || motionEnabled()) return@launch
-                        startCamera(force = true)
+                    cameraSession.schedule {
+                        if (captureRunning && !hasActiveClients() && currentSurfaceProvider == null) {
+                            startCameraLocked(force = true)
+                        }
                     }
                 } else {
                     debouncedStartCamera()
@@ -741,29 +733,26 @@ class StreamingService : LifecycleService() {
      * after [delayMs]. Immediate restarts (force=true) bypass the debounce.
      */
     private fun debouncedStartCamera(force: Boolean = false, delayMs: Long = 300) {
-        if (force) {
-            pendingStartJob?.cancel()
-            pendingStartJob = null
-            launchMain { startCamera(force = true) }
-            return
-        }
-        pendingStartJob?.cancel()
-        pendingStartJob = lifecycleScope.launch(Dispatchers.Main) {
-            kotlinx.coroutines.delay(delayMs)
-            startCamera()
+        launchMain {
+            cameraSession.schedule(if (force) 0 else delayMs) { startCameraLocked(force) }
         }
     }
 
-    private suspend fun startCamera(force: Boolean = false) = cameraMutex.withLock {
+    private suspend fun startCamera(force: Boolean = false) = cameraSession.serialized {
+        if (!cameraSession.recordingOwnsSession) startCameraLocked(force)
+    }
+
+    /** Caller owns the session lock, including any subsequent recorder attachment. */
+    private suspend fun startCameraLocked(force: Boolean = false): Boolean {
         Log.i(TAG, "startCamera() called. force=$force, selectedCameraId=$selectedCameraId, frontFacing=$frontFacing, currentSurfaceProvider=$currentSurfaceProvider, captureRunning=$captureRunning")
         if (!allPermissionsGranted()) {
             Log.w(TAG, "startCamera bypassed: permissions not granted")
-            return@withLock
+            return false
         }
         val hasClients = encoders.any { it.hasClients() }
         if (!force && !hasClients && currentSurfaceProvider == null && !motionEnabled()) {
             Log.i(TAG, "startCamera bypassed: no force, no clients, and preview surface is null")
-            return@withLock
+            return false
         }
         // An explicit restart must always be able to tear down the current session — even one the
         // torch is holding open. Otherwise the flag permanently neuters stopCamera(), the old
@@ -771,7 +760,7 @@ class StreamingService : LifecycleService() {
         // camera open fails until process death. Restore the hold after a successful start.
         val resumeTorchHold = cameraHeldForTorch
         cameraHeldForTorch = false
-        stopCamera()
+        stopCamera(shutdown = true)
         h264StreamingEncoder?.awaitRelease()
         try {
             val want = desiredSize()
@@ -808,7 +797,7 @@ class StreamingService : LifecycleService() {
                 // back to the Camera1 backend so streaming and snapshots keep working on such devices.
                 if (needsFrames && !waitForCameraXFrame()) {
                     Log.w(TAG, "CameraX bound but no frames within ${CAMERAX_FRAME_GRACE_MS}ms — Camera2 session config failed on this device; falling back to Camera1")
-                    stopCamera()
+                    stopCamera(shutdown = true)
                     // Remember the device is Camera2-broken (not the API preference) so the CameraX
                     // on-phone preview can come back once frames are no longer needed, while future
                     // frame-needing starts go straight to Camera1 without another 8s wait.
@@ -847,9 +836,14 @@ class StreamingService : LifecycleService() {
                     try { kotlinx.coroutines.delay(200) } catch (_: Exception) { break }
                 }
             }
+            return true
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            stopCamera(shutdown = true)
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "startCamera failed", e)
-            stopCamera()
+            stopCamera(shutdown = true)
+            return false
         }
     }
 
@@ -978,7 +972,8 @@ class StreamingService : LifecycleService() {
         Log.i(TAG, "stream ${camId()} api=camerax")
     }
 
-    private fun stopCamera() {
+    private fun stopCamera(shutdown: Boolean = false) {
+        if (!shutdown && cameraSession.recordingOwnsSession) return
         // Single choke point for every on-demand release path (last viewer left, preview hidden,
         // stream reconfigured). The torch-off handler clears the flag before calling in, so it is
         // the one caller that can still close a torch-held session.
@@ -1251,6 +1246,7 @@ class StreamingService : LifecycleService() {
      */
     fun snapshot(cameraId: String): ByteArray? {
         synchronized(snapLock) {
+            if (recordingNeeded || localRecorder?.isRecording == true) return null
             snapshotInProgress = true
             try {
                 val deadline = System.currentTimeMillis() + SNAPSHOT_DEADLINE_MS
@@ -1455,7 +1451,17 @@ class StreamingService : LifecycleService() {
     // Synchronized so the timestamp check and the (async) dispatch stay ordered per request.
     @Synchronized
     private fun handleRemoteControl(key: String, value: String, ts: Long = 0L) {
-        if (!acceptControl(key, ts)) return
+        launchMain {
+            if (!acceptControl(key, ts)) return@launchMain
+            if ((cameraSession.recordingOwnsSession || recordingNeeded) && key in setOf("camera", "resolution", "api", "rotate", "scale", "fps")) {
+                deferredRecordingControls[key] = value
+            } else {
+                applyRemoteControl(key, value)
+            }
+        }
+    }
+
+    private fun applyRemoteControl(key: String, value: String) {
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
         // Use the stored camera preference key when persisting per-camera settings so
         // reads from getStreamSettings() (which uses the saved `camera_id`) match.
@@ -1644,81 +1650,104 @@ class StreamingService : LifecycleService() {
 
     // ---------------- local recording ----------------
 
-    fun startRecording(): RecordingResponse {
-        if (localRecorder?.isRecording == true) return Triple(false, "409 Conflict",
-            """{"error":"already_recording","message":"Recording is already in progress","uri":"${localRecorder?.recordingLocation() ?: ""}"}"""
-        )
+    // HTTP callbacks are synchronous. Never block Main: camera binding needs that dispatcher.
+    private fun recordingRequest(block: suspend () -> RecordingResponse): RecordingResponse {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return recordingError("503 Service Unavailable", "main_thread", "Recording requests must run off the UI thread")
+        }
+        return kotlinx.coroutines.runBlocking { lifecycleScope.async(Dispatchers.Main) { block() }.await() }
+    }
 
-        // Make the camera deliver frames and initialize the H.264 encoder even with no viewers
-        // connected; cleared once localRecorder takes over (or the start fails).
+    private fun recordingError(status: String, error: String, message: String): RecordingResponse =
+        Triple(false, status, org.json.JSONObject().put("error", error).put("message", message).toString())
+
+    fun startRecording(): RecordingResponse = recordingRequest {
+        if (snapshotInProgress) return@recordingRequest recordingError(
+            "409 Conflict", "snapshot_in_progress", "Retry recording after the snapshot completes")
+        if (cameraSession.recordingOwnsSession || recordingNeeded) return@recordingRequest recordingError(
+            "409 Conflict", "already_recording", "Recording is already starting or in progress")
+        var recorder: LocalRecorder? = null
         recordingNeeded = true
-
-        // Ensure camera and H.264 encoder are started on demand
-        if (!captureRunning || !hasActiveClients()) {
-            val latch = CountDownLatch(1)
-            launchMain {
-                startCamera(force = true)
-                latch.countDown()
+        try {
+            cameraSession.startRecording(30_000) {
+                // Always rebuild after cancelling settings jobs; readiness belongs to this session.
+                check(startCameraLocked(force = true)) { "Camera initialization failed" }
+                while (backend?.ready != true || h264StreamingEncoder?.h264HardwareEncoder == null) {
+                    kotlinx.coroutines.delay(50)
+                }
+                val streamingEncoder = checkNotNull(h264StreamingEncoder)
+                val enc = checkNotNull(streamingEncoder.h264HardwareEncoder)
+                check(!enc.isReleased) { "Encoder was released" }
+                val created = LocalRecorder(this@StreamingService, enc.width, enc.height)
+                recorder = created
+                kotlinx.coroutines.withContext(Dispatchers.IO) { created.start() }
+                // Initialization/storage work can suspend while analysis replaces an encoder.
+                val attached = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    streamingEncoder.attachRecorder(enc) { bytes, key, pts -> created.feedFrame(bytes, key, pts) }
+                }
+                check(attached) {
+                    "Encoder changed during recording startup"
+                }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                localRecorder = created
+                recordingNeeded = false
+                enc.requestKeyFrame()
+                Triple(true, "201 Created", created.statusJson())
             }
-            try { latch.await(3, TimeUnit.SECONDS) } catch (_: Exception) {}
-        }
-
-        var enc = h264StreamingEncoder?.h264HardwareEncoder
-        var attempts = 0
-        while (enc == null && attempts < 20) {
-            try { Thread.sleep(100) } catch (_: Exception) {}
-            enc = h264StreamingEncoder?.h264HardwareEncoder
-            attempts++
-        }
-
-        if (enc == null) {
-            recordingNeeded = false
-            restoreNoViewerCameraState()
-            return Triple(false, "503 Service Unavailable",
-                """{"error":"no_encoder","message":"Failed to initialize H.264 encoder"}"""
-            )
-        }
-
-        return try {
-            val recorder = LocalRecorder(this, enc.width, enc.height)
-            recorder.start()
-            enc.onRecordFrame = { bytes, isKey, pts -> recorder.feedFrame(bytes, isKey, pts) }
-            enc.requestKeyFrame()
-            localRecorder = recorder
-            recordingNeeded = false
-            Triple(true, "201 Created", recorder.statusJson())
         } catch (e: Exception) {
-            Log.e(TAG, "startRecording failed", e)
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                try {
+                    h264StreamingEncoder?.detachRecorder()
+                    recorder?.stop()
+                } catch (cleanupError: Exception) {
+                    Log.e(TAG, "Failed to clean up recording startup", cleanupError)
+                }
+            }
+            localRecorder = null
             recordingNeeded = false
+            cameraSession.recordingStopped()
             restoreNoViewerCameraState()
-            Triple(false, "500 Internal Server Error",
-                """{"error":"start_failed","message":"${e.message?.replace("\"", "'") ?: "unknown error"}"}"""
-            )
+            applyDeferredRecordingControls()
+            if (hasActiveClients() || currentSurfaceProvider != null) debouncedStartCamera()
+            if (e is kotlinx.coroutines.TimeoutCancellationException) {
+                recordingError("503 Service Unavailable", "startup_timeout", "Camera/encoder did not become ready within 30 seconds")
+            } else {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.e(TAG, "startRecording failed", e)
+                recordingError("503 Service Unavailable", "start_failed", e.message ?: "Recording startup failed")
+            }
         }
     }
 
-    fun stopRecording(): RecordingResponse {
-        val recorder = localRecorder ?: return Triple(false, "409 Conflict",
-            """{"error":"not_recording","message":"No recording is in progress"}"""
-        )
-        return try {
-            h264StreamingEncoder?.h264HardwareEncoder?.onRecordFrame = null
-            val finalStatus = recorder.statusJson()
-            recorder.stop()
-            localRecorder = null
-
-            // If no remote network streaming clients are connected, update camera state
-            if (!encoders.any { it.hasClients() }) {
+    fun stopRecording(): RecordingResponse = recordingRequest {
+        cameraSession.serialized {
+            val recorder = localRecorder ?: return@serialized recordingError(
+                "409 Conflict", "not_recording", "No recording is in progress")
+            try {
+                val finalStatus = recorder.statusJson()
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    h264StreamingEncoder?.detachRecorder()
+                    recorder.stop()
+                }
+                Triple(true, "200 OK", finalStatus)
+            } catch (e: Exception) {
+                Log.e(TAG, "stopRecording failed", e)
+                recordingError("500 Internal Server Error", "stop_failed", e.message ?: "Recording stop failed")
+            } finally {
+                localRecorder = null
+                cameraSession.recordingStopped()
                 restoreNoViewerCameraState()
+                applyDeferredRecordingControls()
+                if (hasActiveClients() || currentSurfaceProvider != null) debouncedStartCamera()
             }
-            Triple(true, "200 OK", finalStatus)
-        } catch (e: Exception) {
-            Log.e(TAG, "stopRecording failed", e)
-            localRecorder = null
-            Triple(false, "500 Internal Server Error",
-                """{"error":"stop_failed","message":"${e.message?.replace("\"", "'") ?: "unknown error"}"}"""
-            )
         }
+    }
+
+    private fun applyDeferredRecordingControls() {
+        val controls = deferredRecordingControls.toMap()
+        deferredRecordingControls.clear()
+        controls.forEach { (key, value) -> applyRemoteControl(key, value) }
+        if (controls.isNotEmpty()) debouncedStartCamera()
     }
 
     fun getRecordingStatus(): String {
@@ -1734,6 +1763,7 @@ class StreamingService : LifecycleService() {
     private fun restoreNoViewerCameraState() {
         if (encoders.any { it.hasClients() }) return
         launchMain {
+            if (cameraSession.recordingOwnsSession) return@launchMain
             if (currentSurfaceProvider != null) {
                 debouncedStartCamera()
             } else {

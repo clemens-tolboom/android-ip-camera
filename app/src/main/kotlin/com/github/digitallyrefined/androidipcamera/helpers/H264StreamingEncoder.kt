@@ -25,7 +25,7 @@ class H264StreamingEncoder(
         private const val TAG = "H264StreamingEncoder"
     }
 
-    var h264HardwareEncoder: H264HardwareEncoder? = null
+    @Volatile var h264HardwareEncoder: H264HardwareEncoder? = null
         private set
     /** RTSP server sharing this encoder's output, when RTSP is enabled. */
     @Volatile internal var rtspServer: RtspServer? = null
@@ -49,6 +49,7 @@ class H264StreamingEncoder(
         { runnable -> Thread(runnable, "H264NetworkWriter").apply { isDaemon = true } }
     ).apply { allowCoreThreadTimeOut(true) }
 
+    @Synchronized
     override fun processFrame(image: ImageProxy) {
         val enc = h264HardwareEncoder
         if (enc != null && enc.useSurface) {
@@ -71,6 +72,8 @@ class H264StreamingEncoder(
             val outW = if (swap) image.height else image.width
             val outH = if (swap) image.width else image.height
             if (encMutable == null || encMutable.width != outW || encMutable.height != outH) {
+                // Keep the recording's dimensions and callback attached until explicit stop.
+                if (encMutable?.onRecordFrame != null) return
                 invalidatePendingWrites()
                 encMutable?.stop()
                 val fps = prefs.getString("stream_fps", "30")?.toIntOrNull() ?: 30
@@ -129,6 +132,7 @@ class H264StreamingEncoder(
         captureRunning = true
     }
 
+    @Synchronized
     override fun stop() {
         backend?.stop()
         backend = null
@@ -255,6 +259,7 @@ class H264StreamingEncoder(
     /**
      * Set the H.264 hardware encoder (used by Camera1 backend).
      */
+    @Synchronized
     fun setEncoder(encoder: H264HardwareEncoder?) {
         invalidatePendingWrites()
         h264HardwareEncoder?.let { old ->
@@ -265,6 +270,17 @@ class H264StreamingEncoder(
         }
         h264HardwareEncoder = encoder
     }
+
+    /** Atomic identity check against analysis-thread encoder replacement. */
+    @Synchronized
+    fun attachRecorder(expected: H264HardwareEncoder, feed: (ByteArray, Boolean, Long) -> Unit): Boolean {
+        if (h264HardwareEncoder !== expected || expected.isReleased) return false
+        expected.onRecordFrame = feed
+        return true
+    }
+
+    @Synchronized
+    fun detachRecorder() { h264HardwareEncoder?.onRecordFrame = null }
 
     private fun invalidatePendingWrites() {
         writerGeneration.incrementAndGet()
