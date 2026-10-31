@@ -4,6 +4,9 @@
 # Ignore Gradle build output directory
 build
 
+# Track the container build helper despite the generic build/ ignore
+!scripts/build
+
 .idea
 
 local.properties
