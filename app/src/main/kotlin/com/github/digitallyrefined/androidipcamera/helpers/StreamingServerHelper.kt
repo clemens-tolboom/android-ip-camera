@@ -60,6 +60,7 @@ class StreamingServerHelper(
     private val onRecordStart: () -> Triple<Boolean, String, String> = { Triple(false, "503 Service Unavailable", """{"error":"unavailable"}""") },
     private val onRecordStop: () -> Triple<Boolean, String, String> = { Triple(false, "409 Conflict", """{"error":"not_recording"}""") },
     private val onRecordStatus: () -> String = { """{"recording":false}""" },
+    private val onEncoderStatus: () -> JSONObject = { JSONObject() },
     private val onStreamingEnabledChanged: (Boolean) -> Unit = {},
     private val onCaptureFpsStatus: () -> CaptureFpsStatus? = { null }
 ) {
@@ -1494,6 +1495,7 @@ class StreamingServerHelper(
         val wifiStrength: Int,
         val settings: StreamSettings,
         val captureFps: CaptureFpsStatus?,
+        val encoderStatus: JSONObject,
         val perCameraSettings: Map<String, Map<String, String>> = emptyMap(),
     ) {
         fun toJsonString(): String = JSONObject().apply {
@@ -1535,6 +1537,7 @@ class StreamingServerHelper(
                     })
                 }
             })
+            put("h264Encoder", encoderStatus)
             put("batteryPercent", batteryPercent)
             put("wifiStrength", wifiStrength)
             put("settings", JSONObject().apply {
@@ -1679,6 +1682,7 @@ class StreamingServerHelper(
             wifiStrength = getWifiStrength(),
             settings = getStreamSettings(cameraList),
             captureFps = onCaptureFpsStatus(),
+            encoderStatus = onEncoderStatus(),
             perCameraSettings = perCamera,
         )
     }
@@ -1729,7 +1733,6 @@ class StreamingServerHelper(
     } catch (_: Throwable) { false }
 
     private fun buildCameraInfoList(idle: Boolean): List<InfoCamera> {
-        val encCaps = H264HardwareEncoder.caps()
         val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         return try {
             val sources = cameraInfoSources(cm)
@@ -1786,8 +1789,8 @@ class StreamingServerHelper(
                         @Suppress("DEPRECATION") c1.release()
                     } catch (_: Exception) {}
                 }
+                // Camera sizes are candidates; the selected encoder validates the rotated format at startup.
                 val sizes = set
-                    .filter { it.first <= encCaps.maxW && it.second <= encCaps.maxH }
                     .sortedByDescending { it.first * it.second }
                     .map { InfoSize(it.first, it.second) }
                 // Check both physical and logical characteristics for flash availability

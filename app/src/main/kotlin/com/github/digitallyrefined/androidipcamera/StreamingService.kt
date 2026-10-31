@@ -357,6 +357,8 @@ class StreamingService : LifecycleService() {
         }
     }
 
+    @Volatile private var encoderConfigurationError: String? = null
+
     private fun initServer() {
         if (streamingServerHelper == null) {
             streamingServerHelper = StreamingServerHelper(
@@ -369,6 +371,16 @@ class StreamingService : LifecycleService() {
                 onRecordStart = { startRecording() },
                 onRecordStop = { stopRecording() },
                 onRecordStatus = { getRecordingStatus() },
+                onEncoderStatus = {
+                    val encoder = h264StreamingEncoder?.h264HardwareEncoder
+                    org.json.JSONObject().apply {
+                        put("codec", encoder?.codecName ?: org.json.JSONObject.NULL)
+                        put("width", encoder?.width ?: org.json.JSONObject.NULL)
+                        put("height", encoder?.height ?: org.json.JSONObject.NULL)
+                        put("fps", encoder?.frameRate ?: org.json.JSONObject.NULL)
+                        put("error", encoderConfigurationError ?: h264StreamingEncoder?.configurationError ?: org.json.JSONObject.NULL)
+                    }
+                },
                 // /control/stop must also drop RTSP viewers, which the HTTP server does not own.
                 onStreamingEnabledChanged = { enabled -> if (!enabled) rtspServer?.disconnectAll() },
                 onCaptureFpsStatus = { backend?.fpsStatus }
@@ -725,7 +737,6 @@ class StreamingService : LifecycleService() {
 
     /** Desired stream size from the resolution pref; "auto" → 1080p target (the device gives its best ≤ that). */
     private fun desiredSize(): Size {
-        val caps = H264HardwareEncoder.caps()
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
         val streamRes = prefs.getString("stream_res", "auto") ?: "auto"
         if (streamRes == "auto") {
@@ -736,12 +747,10 @@ class StreamingService : LifecycleService() {
                 "low" -> Size(800, 600)
                 else -> Size(800, 600)
             }
-            return Size(minOf(target.width, caps.maxW), minOf(target.height, caps.maxH))
+            return target
         }
-        val m = Regex("(\\d+)x(\\d+)").find(streamRes)
-        val w = m?.groupValues?.get(1)?.toIntOrNull() ?: 1920
-        val h = m?.groupValues?.get(2)?.toIntOrNull() ?: 1080
-        return Size(minOf(w, caps.maxW), minOf(h, caps.maxH))
+        val size = requireNotNull(AvcFormatPolicy.parseSize(streamRes)) { "Invalid stream resolution: $streamRes" }
+        return Size(size.width, size.height)
     }
 
     private suspend fun startCameraIfNeeded() { if (!captureRunning) startCamera() }
@@ -791,6 +800,7 @@ class StreamingService : LifecycleService() {
         stopCamera()
         h264StreamingEncoder?.awaitRelease()
         try {
+            encoderConfigurationError = null
             val want = desiredSize()
             val prefs = PreferenceManager.getDefaultSharedPreferences(this)
             // If no camera id has been resolved yet (fresh process / the UI never sent a camera
@@ -865,6 +875,7 @@ class StreamingService : LifecycleService() {
                 }
             }
         } catch (e: Exception) {
+            encoderConfigurationError = e.message ?: e.javaClass.simpleName
             Log.e(TAG, "startCamera failed", e)
             stopCamera()
         }
@@ -917,19 +928,12 @@ class StreamingService : LifecycleService() {
                 size.height,
                 fpsCoerced,
                 H264HardwareEncoder.bitrateFor(size.width, size.height),
-                true // useSurface = true
+                true, // useSurface = true
+                allowSizeFallback = true
             ) { d, k, pts -> h264.broadcastH264(d, k, pts) }
 
-            // Encode in the picture's shape (portrait when the camera image is upright portrait).
-            // Some older encoders reject portrait sizes; they keep the landscape frame instead.
-            val frame = surfaceEncoderSize(want)
-            val enc = try {
-                newEncoder(frame)
-            } catch (e: Exception) {
-                if (frame == want) throw e
-                Log.w(TAG, "H.264 encoder rejected ${frame.width}x${frame.height}, using ${want.width}x${want.height}: ${e.message}")
-                newEncoder(want)
-            }
+            // Validate the final rotated dimensions. GL can scale, preserving the picture's aspect ratio.
+            val enc = newEncoder(surfaceEncoderSize(want))
 
             h264.setEncoder(enc)
             streamingServerHelper?.resetH264Wait()
@@ -1110,10 +1114,10 @@ class StreamingService : LifecycleService() {
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
         val fps = prefs.getString("stream_fps", "30")?.toIntOrNull() ?: 30
         val fpsCoerced = fps.coerceIn(1, 60)
-        val enc = H264HardwareEncoder(sz.width, sz.height, fpsCoerced, H264HardwareEncoder.bitrateFor(sz.width, sz.height), true) { d, k, pts -> h264StreamingEncoder?.broadcastH264(d, k, pts) }
+        val enc = H264HardwareEncoder(sz.width, sz.height, fpsCoerced, H264HardwareEncoder.bitrateFor(sz.width, sz.height), true, allowSizeFallback = true) { d, k, pts -> h264StreamingEncoder?.broadcastH264(d, k, pts) }
         h264StreamingEncoder?.setEncoder(enc)
         streamingServerHelper?.resetH264Wait()
-        return CameraGlPipe(enc.inputSurface!!, sz.width, sz.height, fpsCoerced).also {
+        return CameraGlPipe(enc.inputSurface!!, enc.width, enc.height, fpsCoerced).also {
             it.mirror = readMirrorPref()
             it.rotation = quantizedRotation(readRotatePref())
             it.start()
@@ -1578,9 +1582,12 @@ class StreamingService : LifecycleService() {
                 if (value in listOf("low", "medium", "high")) {
                     prefs.edit().putString("camera_resolution", value).apply()
                     debouncedStartCamera()
-                } else if (value == "auto" || value == "max" || Regex("\\d+x\\d+").matches(value)) {
+                } else if (value == "auto" || value == "max" || AvcFormatPolicy.parseSize(value) != null) {
                     prefs.edit().putString("stream_res", if (value == "max") "auto" else value).apply()
                     debouncedStartCamera()
+                } else {
+                    encoderConfigurationError = "Invalid stream resolution: $value"
+                    Log.w(TAG, encoderConfigurationError!!)
                 }
             }
             "rotate" -> {
