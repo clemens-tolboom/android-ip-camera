@@ -951,6 +951,10 @@ class StreamingService : LifecycleService() {
             onEncoderSurfaceFallback = {
                 Log.i(TAG, "CameraX SurfaceProvider fallback triggered: switching H.264 to software YUV mode")
                 h264?.setEncoder(null)
+            },
+            onDisplayPreviewFallback = {
+                Log.w(TAG, "On-phone preview unavailable for the selected CameraX combination")
+                Toast.makeText(this, R.string.camera_preview_unavailable, Toast.LENGTH_LONG).show()
             }
         ) { img ->
             try {
