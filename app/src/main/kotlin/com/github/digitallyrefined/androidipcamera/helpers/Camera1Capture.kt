@@ -22,6 +22,9 @@ class Camera1Capture(private val cameraId: Int, targetW: Int, targetH: Int) : Ca
     override val height get() = chosenH
     val previewRotation: Int get() = jpegRotation(cameraId)
 
+    @Volatile override var fpsStatus: CaptureFpsStatus? = null
+        private set
+
     private var previewBuffers: Array<ByteArray>? = null
     private var onPreviewFrame: ((ByteArray) -> Unit)? = null
     @Volatile private var torchEnabled = false
@@ -44,11 +47,10 @@ class Camera1Capture(private val cameraId: Int, targetW: Int, targetH: Int) : Ca
         val p = camera.parameters
         p.setRecordingHint(true)                         // video mode → enables concurrent video snapshot
         p.setPreviewSize(chosenW, chosenH)
-        p.supportedPreviewFpsRange?.let { ranges ->
-            val want = fps * 1000
-            (ranges.filter { it[1] >= want }.minByOrNull { it[0] } ?: ranges.maxByOrNull { it[1] })
-                ?.let { p.setPreviewFpsRange(it[0], it[1]) }
-        }
+        val selected = CaptureFpsSelector.select(
+            p.supportedPreviewFpsRange.orEmpty().map { CaptureFpsRange(it[0], it[1]) }, fps * 1000
+        )
+        selected?.let { p.setPreviewFpsRange(it.lower, it.upper) }
         listOf(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO,
                Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE,
                Camera.Parameters.FOCUS_MODE_AUTO)
@@ -58,7 +60,22 @@ class Camera1Capture(private val cameraId: Int, targetW: Int, targetH: Int) : Ca
         p.supportedPictureSizes?.maxByOrNull { it.width * it.height }?.let { p.setPictureSize(it.width, it.height) }
         p.setRotation(jpegRotation(cameraId))
         try { p.set("jpeg-quality", "95") } catch (_: Exception) {}
-        camera.parameters = p
+        try {
+            camera.parameters = p
+        } catch (e: RuntimeException) {
+            if (selected == null) throw e
+            // Preserve the legacy automatic-rate path when a HAL rejects this size/rate pairing.
+            val automatic = IntArray(2).also { camera.parameters.getPreviewFpsRange(it) }
+            p.setPreviewFpsRange(automatic[0], automatic[1])
+            camera.parameters = p
+            Log.w(TAG, "Requested FPS rejected; retaining automatic preview range", e)
+        }
+        val actual = IntArray(2).also { camera.parameters.getPreviewFpsRange(it) }
+        val actualRange = CaptureFpsRange(actual[0] / 1000, actual[1] / 1000)
+        fpsStatus = CaptureFpsStatus(fps, actualRange,
+            if (selected == null || actual[0] != selected.lower || actual[1] != selected.upper) "automatic_fallback"
+            else if (fps * 1000 in actual[0]..actual[1]) "requested_range" else "unsupported_target_fallback")
+        Log.i(TAG, "FPS $fpsStatus (not measured FPS)")
         camera.setPreviewTexture(st)
         camera.startPreview()
         Log.i(TAG, "Camera1[$cameraId] preview ${chosenW}x$chosenH recHint focus=${p.focusMode}")

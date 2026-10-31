@@ -9,6 +9,7 @@ package com.github.digitallyrefined.androidipcamera.helpers
 interface CaptureBackend {
     val width: Int
     val height: Int
+    val fpsStatus: CaptureFpsStatus? get() = null
     val ready: Boolean get() = true        // CameraX overrides (async bind); Camera1 is ready after start()
     /** Full-resolution JPEG; concurrent with the live stream where the hardware allows. */
     fun captureStill(onJpeg: (ByteArray?) -> Unit)

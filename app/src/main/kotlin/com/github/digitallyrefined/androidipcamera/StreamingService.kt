@@ -196,10 +196,18 @@ class StreamingService : LifecycleService() {
         }
     }
 
+    // Keep this listener strongly referenced; SharedPreferences retains listeners weakly.
+    private val fpsPreferenceListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "stream_fps") launchMain {
+            if (captureRunning) startCamera(force = true, fpsChangeOnly = true)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         startForegroundService()
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        prefs.registerOnSharedPreferenceChangeListener(fpsPreferenceListener)
         val savedCameraId = prefs.getString(PREF_CAMERA_ID, null)
         if (savedCameraId != null) {
             // resolveCamera maps "1:3" → the openable camera ID (e.g. "3") and correct facing
@@ -234,6 +242,8 @@ class StreamingService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        PreferenceManager.getDefaultSharedPreferences(this)
+            .unregisterOnSharedPreferenceChangeListener(fpsPreferenceListener)
         super.onDestroy()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
             try { unregisterReceiver(notificationChannelReceiver) } catch (_: Exception) {}
@@ -360,7 +370,8 @@ class StreamingService : LifecycleService() {
                 onRecordStop = { stopRecording() },
                 onRecordStatus = { getRecordingStatus() },
                 // /control/stop must also drop RTSP viewers, which the HTTP server does not own.
-                onStreamingEnabledChanged = { enabled -> if (!enabled) rtspServer?.disconnectAll() }
+                onStreamingEnabledChanged = { enabled -> if (!enabled) rtspServer?.disconnectAll() },
+                onCaptureFpsStatus = { backend?.fpsStatus }
             )
             // Initialize encoders with the streaming server helper
             h264StreamingEncoder = H264StreamingEncoder(this, streamingServerHelper!!) { Log.i(TAG, "H264: $it"); onLog?.invoke(it) }
@@ -754,7 +765,13 @@ class StreamingService : LifecycleService() {
         }
     }
 
-    private suspend fun startCamera(force: Boolean = false) = cameraMutex.withLock {
+    private suspend fun startCamera(force: Boolean = false, fpsChangeOnly: Boolean = false) = cameraMutex.withLock {
+        // The restart branch owns recording transactions. A preference change is pending until a
+        // later capture start if recording is active/starting; never stop a recording to apply FPS.
+        if (fpsChangeOnly && (!captureRunning || recordingNeeded || localRecorder?.isRecording == true)) {
+            Log.i(TAG, "FPS change deferred until next capture start")
+            return@withLock
+        }
         Log.i(TAG, "startCamera() called. force=$force, selectedCameraId=$selectedCameraId, frontFacing=$frontFacing, currentSurfaceProvider=$currentSurfaceProvider, captureRunning=$captureRunning")
         if (!allPermissionsGranted()) {
             Log.w(TAG, "startCamera bypassed: permissions not granted")
@@ -870,7 +887,7 @@ class StreamingService : LifecycleService() {
         // Camera1 → GL pipe → surface encoder (true 1920×1080 on legacy HALs).
         val cap = Camera1Capture(camera1IndexForSelectedOrFacing(frontFacing), want.width, want.height)
         val pipe = newPipe(Size(cap.chosenW, cap.chosenH))
-        cap.start(pipe.surfaceTexture)
+        cap.start(pipe.surfaceTexture, requestedCaptureFps())
         val mjpeg = mjpegStreamingEncoder?.takeIf { it.hasClients() }
         val motion = motionMonitor?.takeIf { it.enabled }
         if (mjpeg != null || motion != null) {
@@ -882,6 +899,9 @@ class StreamingService : LifecycleService() {
         backend = cap
         Log.i(TAG, "stream ${camId()} api=camera1 ${cap.chosenW}x${cap.chosenH}")
     }
+
+    private fun requestedCaptureFps(): Int =
+        (PreferenceManager.getDefaultSharedPreferences(this).getString("stream_fps", "30")?.toIntOrNull() ?: 30).coerceIn(1, 60)
 
     private fun startCameraXBackend(want: Size) {
         // CameraX → ImageAnalysis YUV → encoders + optional Preview on the phone.
@@ -945,7 +965,7 @@ class StreamingService : LifecycleService() {
 
         val showScreenPreview = !encoders.any { it.hasClients() } && currentSurfaceProvider != null
         backend = CameraXCapture(
-            this, this, frontFacing, selectedCameraId, want,
+            this, this, frontFacing, selectedCameraId, want, requestedCaptureFps(),
             if (showScreenPreview) currentSurfaceProvider else null,
             h264SurfaceProvider,
             onEncoderSurfaceFallback = {
@@ -1464,6 +1484,11 @@ class StreamingService : LifecycleService() {
         // physical id fallback (if id is "logical:physical" this extracts physical)
         val physicalId = id?.substringAfter(':', id ?: "") ?: ""
         when (key) {
+            "fps" -> {
+                val fps = value.toIntOrNull()?.takeIf { it in 1..60 } ?: return
+                prefs.edit().putString("stream_fps", fps.toString()).apply()
+                return // listener handles active capture/encoder reconfiguration
+            }
             "torch" -> {
                 val current = backend?.getTorch()
                     ?: (prefs.getString(PREF_CAMERA_TORCH, "off") == "on")
