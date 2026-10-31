@@ -165,12 +165,13 @@ When the streaming server is running (default port `4444`, via `https://` or `ht
   * **Usage:** Query available camera sensors, their supported resolutions, device battery percentage, Wi-Fi signal strength and individual camera len settings.
   * **Format:** `application/json`
 * **Start Recording (`/record/start`, POST)**
-  * **Usage:** Start recording the live camera feed to a local MP4 file. The camera and H.264 encoder are started on demand if not already running.
+  * **Usage:** Start recording the live camera feed to a local MP4 file. Startup cancels pending settings restarts and waits for camera/encoder readiness, with a 30-second startup deadline. A timed-out or failed start returns an error and cannot attach a recorder later.
   * **Responses:**
     * `201 Created`: Recording started; returns the recording status JSON.
-    * `409 Conflict`: `{"error":"already_recording", ...}` — a recording is already in progress.
-    * `503 Service Unavailable`: `{"error":"no_encoder", ...}` — failed to initialize the H.264 encoder.
-    * `500 Internal Server Error`: `{"error":"start_failed", ...}` — recording failed to start.
+    * `409 Conflict`: `{"error":"already_recording", ...}` — a recording is already starting or in progress. `snapshot_in_progress` asks the caller to retry after a snapshot completes.
+    * `503 Service Unavailable`: `{"error":"startup_timeout", ...}` — failed to initialize the H.264 encoder.
+    * `503 Service Unavailable`: `{"error":"start_failed", ...}` — camera, encoder, or recording initialization failed.
+  * **Settings during recording:** Camera, resolution, capture API, rotation, scale, and FPS controls are queued while recording starts or remains active. The newest accepted value per control applies after recording stops; these controls do not end the current file. Android settings saved directly in preferences take effect on the next camera session. Preview and viewer changes also preserve the recording session. Full-resolution snapshots are unavailable during recording.
 * **Stop Recording (`/record/stop`, POST)**
   * **Usage:** Stop the in-progress local MP4 recording and finalize the file.
   * **Responses:**
