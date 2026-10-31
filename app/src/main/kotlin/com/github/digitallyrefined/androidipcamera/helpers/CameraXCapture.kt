@@ -4,10 +4,13 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.TotalCaptureResult
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -56,6 +59,7 @@ class CameraXCapture(
     private val front: Boolean,
     private val cameraId: String?,
     private val desired: Size,
+    private val requestedFps: Int,
     private val previewSurfaceProvider: Preview.SurfaceProvider? = null,
     private val encoderSurfaceProvider: Preview.SurfaceProvider? = null,
     private val onEncoderSurfaceFallback: (() -> Unit)? = null,
@@ -67,8 +71,13 @@ class CameraXCapture(
     @Volatile var encoderSurfaceBound = false
         private set
 
+    @Volatile override var fpsStatus = CaptureFpsStatus(requestedFps)
+        private set
+
     private var provider: ProcessCameraProvider? = null
     private var camera: androidx.camera.core.Camera? = null
+    private var appliedAeRange: Range<Int>? = null
+    @Volatile private var negotiatedPreviewFps = false
     private var imageCapture: ImageCapture? = null
     // Always co-bound with the stream so a still snaps straight from the bound use case (no rebind).
     private var boundSelector: CameraSelector? = null
@@ -119,7 +128,7 @@ class CameraXCapture(
         ?.substringAfter(':', "")
         ?.takeIf { it.isNotBlank() }
 
-    @OptIn(ExperimentalCamera2Interop::class)
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     fun start() {
         val future = ProcessCameraProvider.getInstance(ctx)
         future.addListener({
@@ -131,7 +140,7 @@ class CameraXCapture(
                 val sel = ResolutionSelector.Builder()
                     .setAspectRatioStrategy(AspectRatioStrategy(ratio, AspectRatioStrategy.FALLBACK_RULE_AUTO))
                     .setResolutionStrategy(ResolutionStrategy(desired, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
-                    .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+                    .setAllowedResolutionMode(ResolutionSelector.PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION)
                     .build()
                 val aBuilder = ImageAnalysis.Builder()
                     .setResolutionSelector(sel)
@@ -139,13 +148,21 @@ class CameraXCapture(
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 val analysisInterop = Camera2Interop.Extender(aBuilder)
                 physicalCameraId?.let { analysisInterop.setPhysicalCameraId(it) }
-                // Some legacy HALs (e.g. this phone's rear cam) stall the analysis stream unless an AE
-                // target FPS range is set. Use the WIDEST advertised range, not a fixed lock — AE stays
-                // fully auto (drops low for light in the dark, up to 30 in good light).
-                aeFpsRange()?.let {
-                    analysisInterop.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
-                    Log.i(TAG, "AE fps range $it (auto within range)")
-                }
+                // Preview's target participates in CameraX size/session negotiation. Do not override
+                // AE here: an advertised 60 range alone says nothing about this bound combination.
+                val targetRange = advertisedFpsRange()
+                analysisInterop.setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                        if (released || !negotiatedPreviewFps) return
+                        val range = request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE) ?: return
+                        val next = CaptureFpsStatus(requestedFps, CaptureFpsRange(range.lower, range.upper),
+                            if (requestedFps in range.lower..range.upper) "negotiated_range" else "unsupported_target_fallback")
+                        if (fpsStatus != next) {
+                            fpsStatus = next
+                            Log.i(TAG, "FPS $next (capture request, not measured throughput)")
+                        }
+                    }
+                })
                 analysisUseCase = aBuilder.build()
                     .also { a -> a.setAnalyzer(analysisExec) { img ->
                         width = img.width; height = img.height
@@ -177,11 +194,13 @@ class CameraXCapture(
                 imageCapture = imageCaptureBuilder.build()
                 previewSurfaceProvider?.let { pv ->
                     val previewBuilder = Preview.Builder().setResolutionSelector(sel)
+                    targetRange?.let { previewBuilder.setTargetFrameRate(it) }
                     physicalCameraId?.let { Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(it) }
                     previewUseCase = previewBuilder.build().also { it.setSurfaceProvider(pv) }
                 }
                 encoderSurfaceProvider?.let { pv ->
                     val previewBuilder = Preview.Builder().setResolutionSelector(sel)
+                    targetRange?.let { previewBuilder.setTargetFrameRate(it) }
                     physicalCameraId?.let { Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(it) }
                     encoderUseCase = previewBuilder.build().also { it.setSurfaceProvider(pv) }
                 }
@@ -264,6 +283,7 @@ class CameraXCapture(
                 }
             }
         }
+        configureFps(hasAnalysis = p.isBound(analysis))
         // Re-apply cached controls, since rebinding replaces the camera control.
         val cc = camera?.cameraControl
         if (torchEnabled && hasFlashUnit) try { cc?.enableTorch(true) } catch (_: Exception) {}
@@ -419,14 +439,14 @@ class CameraXCapture(
     }
     override fun setExposure(ev: Int) { exposureIndex = ev; try { camera?.cameraControl?.setExposureCompensationIndex(ev) } catch (_: Exception) {} }
     override fun setZoom(ratio: Float) { zoomRatio = ratio; applyZoomWithRetry(ratio) }
-    @OptIn(ExperimentalCamera2Interop::class)
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     override fun triggerAutoFocus() {
         try {
             val cam = camera ?: return
             // Drop any manual-focus override, else the lingering CONTROL_AF_MODE_OFF
             // defeats the AF scan below.
             manualFocus = null
-            try { Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions() } catch (_: Exception) {}
+            try { resetFocusOverrides(cam) } catch (_: Exception) {}
             val pt = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f)
             cam.cameraControl.startFocusAndMetering(
                 FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
@@ -439,7 +459,7 @@ class CameraXCapture(
      * in diopters (0f = infinity, 1f = the lens' minimum focus distance / nearest). A negative
      * value clears the override and restores continuous autofocus.
      */
-    @OptIn(ExperimentalCamera2Interop::class)
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     override fun setManualFocus(distance: Float) {
         val cam = camera ?: run { manualFocus = distance.takeIf { it >= 0f }; return }
         try {
@@ -447,7 +467,7 @@ class CameraXCapture(
             if (distance < 0f) {
                 // Clear the override so CameraX resumes its own continuous AF.
                 manualFocus = null
-                c2.clearCaptureRequestOptions()
+                resetFocusOverrides(cam)
                 return
             }
             val norm = distance.coerceIn(0f, 1f)
@@ -455,26 +475,97 @@ class CameraXCapture(
             // Nearest focus in diopters; 0f (fixed-focus lens) leaves us at infinity, which is fine.
             val minDist = Camera2CameraInfo.from(cam.cameraInfo)
                 .getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-            c2.captureRequestOptions = CaptureRequestOptions.Builder()
+            c2.addCaptureRequestOptions(CaptureRequestOptions.Builder()
                 .setCaptureRequestOption(
                     CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
                 .setCaptureRequestOption(
                     CaptureRequest.LENS_FOCUS_DISTANCE, norm * minDist)
-                .build()
+                .build())
         } catch (e: Exception) { Log.e(TAG, "manualFocus: ${e.message}") }
     }
 
-    /** The camera's WIDEST advertised AE FPS range — leaves auto-exposure fully free while giving legacy
-     *  HALs the explicit range they need to not stall the analysis stream. Not a fixed-fps lock. */
-    private fun aeFpsRange(): Range<Int>? = try {
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun resetFocusOverrides(cam: androidx.camera.core.Camera) {
+        val options = CaptureRequestOptions.Builder()
+        appliedAeRange?.let { options.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(options.build())
+    }
+
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun characteristics(): CameraCharacteristics? = try {
         val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val boundId = camera?.let { Camera2CameraInfo.from(it.cameraInfo).cameraId }
         val want = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-        val id = logicalCameraId?.takeIf { it in cm.cameraIdList }
+        val id = boundId ?: logicalCameraId?.takeIf { it in cm.cameraIdList }
             ?: cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want }
-            ?: cm.cameraIdList.first()
-        cm.getCameraCharacteristics(id).get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-            ?.maxWithOrNull(compareBy({ it.upper - it.lower }, { it.upper }))
-    } catch (e: Exception) { Log.e(TAG, "aeRange: ${e.message}"); null }
+        id?.let { cm.getCameraCharacteristics(it) }
+    } catch (e: Exception) { Log.w(TAG, "FPS characteristics unavailable", e); null }
+
+    private fun ranges(chars: CameraCharacteristics?): List<CaptureFpsRange> =
+        chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.map { CaptureFpsRange(it.lower, it.upper) }.orEmpty()
+
+    private fun advertisedFpsRange(): Range<Int>? =
+        CaptureFpsSelector.select(ranges(characteristics()), requestedFps)?.let { Range(it.lower, it.upper) }
+
+    /** Binding validates surface combinations. Minimum durations further bound the AE request at the
+     * negotiated repeating-stream sizes. Neither check proves delivered FPS.
+     * Unknown metadata is conservative (<=30); CameraX/default AE remains the last-resort fallback.
+     */
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun configureFps(hasAnalysis: Boolean) {
+        val cam = camera ?: return
+        if (!hasAnalysis) {
+            fpsStatus = CaptureFpsStatus(requestedFps, state = "no_analysis_stream")
+            return
+        }
+        negotiatedPreviewFps = listOfNotNull(previewUseCase, encoderUseCase).any { provider?.isBound(it) == true }
+        if (negotiatedPreviewFps) {
+            // CameraX resolves Preview's target against the whole session/size combination. A raw
+            // interop override here could defeat its lower-rate fallback. Observe its requests instead.
+            fpsStatus = CaptureFpsStatus(requestedFps, state = "awaiting_negotiated_request")
+            return
+        }
+        val chars = characteristics()
+        val map = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val durations = mutableListOf<Long>()
+        fun duration(format: Int, size: Size?) {
+            durations += try { if (size == null) 0L else map?.getOutputMinFrameDuration(format, size) ?: 0L }
+                catch (_: Exception) { 0L }
+        }
+        duration(ImageFormat.YUV_420_888, analysisUseCase?.resolutionInfo?.resolution)
+        // ImageCapture is not a repeating target. Its stall/min duration does not determine the
+        // preview cadence. CameraX still validates its presence when binding the combination.
+        // ImageAnalysis has no public target-frame-rate negotiation API in CameraX 1.4. Do not
+        // infer >30 support for this session from per-output durations or AE ranges alone.
+        val ceiling = minOf(30, CaptureFpsSelector.sessionCeiling(durations))
+        val selected = CaptureFpsSelector.select(ranges(chars), requestedFps, ceiling)
+        if (selected == null) {
+            fpsStatus = CaptureFpsStatus(requestedFps, state = "automatic_unknown_or_unsupported")
+            Log.w(TAG, "FPS requested=$requestedFps; automatic AE (no advertised range within session ceiling=$ceiling)")
+            return
+        }
+        appliedAeRange = Range(selected.lower, selected.upper)
+        fpsStatus = CaptureFpsStatus(requestedFps, state = "applying")
+        val options = CaptureRequestOptions.Builder().setCaptureRequestOption(
+            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(selected.lower, selected.upper)
+        ).build()
+        val applied = Camera2CameraControl.from(cam.cameraControl).addCaptureRequestOptions(options)
+        applied.addListener({
+            if (released || camera !== cam) return@addListener
+            try {
+                applied.get()
+                val state = if (requestedFps in selected.lower..selected.upper) "requested_range" else "unsupported_target_fallback"
+                fpsStatus = CaptureFpsStatus(requestedFps, selected, state)
+                Log.i(TAG, "FPS requested=$requestedFps AE=$selected sessionCeiling=$ceiling; $state (not measured FPS)")
+            } catch (e: Exception) {
+                appliedAeRange = null
+                fpsStatus = CaptureFpsStatus(requestedFps, state = "automatic_request_failed")
+                Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions()
+                Log.w(TAG, "FPS request failed; using automatic CameraX AE", e)
+            }
+        }, main)
+    }
 
     override fun stop() {
         ready = false

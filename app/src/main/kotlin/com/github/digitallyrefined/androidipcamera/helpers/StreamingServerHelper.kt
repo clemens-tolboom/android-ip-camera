@@ -60,7 +60,8 @@ class StreamingServerHelper(
     private val onRecordStart: () -> Triple<Boolean, String, String> = { Triple(false, "503 Service Unavailable", """{"error":"unavailable"}""") },
     private val onRecordStop: () -> Triple<Boolean, String, String> = { Triple(false, "409 Conflict", """{"error":"not_recording"}""") },
     private val onRecordStatus: () -> String = { """{"recording":false}""" },
-    private val onStreamingEnabledChanged: (Boolean) -> Unit = {}
+    private val onStreamingEnabledChanged: (Boolean) -> Unit = {},
+    private val onCaptureFpsStatus: () -> CaptureFpsStatus? = { null }
 ) {
     data class Client(
         val socket: Socket,
@@ -1492,6 +1493,7 @@ class StreamingServerHelper(
         val batteryPercent: Int,
         val wifiStrength: Int,
         val settings: StreamSettings,
+        val captureFps: CaptureFpsStatus?,
         val perCameraSettings: Map<String, Map<String, String>> = emptyMap(),
     ) {
         fun toJsonString(): String = JSONObject().apply {
@@ -1553,6 +1555,13 @@ class StreamingServerHelper(
                 // Motion detection is only exposed in the web UI when ONVIF is enabled.
                 put("onvifEnabled", settings.onvifEnabled)
             })
+            // Settings.fps is the saved preference. This is the active backend's request, not
+            // measured throughput; differing requested values mean a live change is still pending.
+            put("captureFps", captureFps?.let { status -> JSONObject().apply {
+                put("requested", status.requested)
+                put("range", status.range?.let { JSONArray(listOf(it.lower, it.upper)) } ?: JSONObject.NULL)
+                put("state", status.state)
+            } } ?: JSONObject.NULL)
             put("appVersion", context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty())
         }.toString()
     }
@@ -1669,6 +1678,7 @@ class StreamingServerHelper(
             batteryPercent = getBatteryPercent(),
             wifiStrength = getWifiStrength(),
             settings = getStreamSettings(cameraList),
+            captureFps = onCaptureFpsStatus(),
             perCameraSettings = perCamera,
         )
     }
