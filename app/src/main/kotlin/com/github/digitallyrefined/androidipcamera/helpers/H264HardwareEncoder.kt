@@ -3,7 +3,6 @@ package com.github.digitallyrefined.androidipcamera.helpers
 import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
-import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Bundle
 import android.os.Handler
@@ -22,16 +21,25 @@ import androidx.camera.core.ImageProxy
  * to keyframes.
  */
 class H264HardwareEncoder(
-    val width: Int,
-    val height: Int,
+    width: Int,
+    height: Int,
     frameRate: Int,
     bitRate: Int,
     val useSurface: Boolean,
     /** Seconds between keyframes. Longer saves bandwidth; new viewers wait up to this long. */
     keyFrameIntervalSec: Int = 1,
+    allowSizeFallback: Boolean = false,
     private val onNal: (ByteArray, Boolean, Long) -> Unit
 ) {
-    private val codec: MediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    private val codec: MediaCodec = run {
+        require(width > 0 && height > 0 && frameRate > 0 && bitRate > 0) { "Invalid AVC size/rate/bitrate" }
+        MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    }
+    val codecName: String = codec.name
+    val width: Int
+    val height: Int
+    val frameRate: Int = frameRate
+    val effectiveBitRate: Int
     private val codecLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var codecReleased = false
@@ -57,16 +65,38 @@ class H264HardwareEncoder(
         get() = codecReleased
 
     init {
-        val colorFormat = if (useSurface) MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                          else pickYuvFormat()   // sets semiPlanar; NV12 if the HW takes it, else I420
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyFrameIntervalSec)
-            try { setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) } catch (_: Exception) {}
-        }
         try {
+            val caps = codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val video = requireNotNull(caps.videoCapabilities) { "No AVC video capabilities for $codecName" }
+            val colorFormat = if (useSurface) MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                              else pickYuvFormat()
+            require(colorFormat in caps.colorFormats) { "$codecName does not support input color format $colorFormat" }
+            effectiveBitRate = bitRate.coerceIn(video.bitrateRange.lower, video.bitrateRange.upper)
+            fun format(size: AvcFormatPolicy.Size) = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC, size.width, size.height
+            ).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
+                setInteger(MediaFormat.KEY_BIT_RATE, effectiveBitRate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyFrameIntervalSec)
+                if (caps.encoderCapabilities.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)) {
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                }
+            }
+            val selected = AvcFormatPolicy.select(
+                AvcFormatPolicy.Size(width, height), frameRate, video.widthAlignment, video.heightAlignment,
+                allowSizeFallback && useSurface
+            ) { size, rate ->
+                video.isSizeSupported(size.width, size.height) &&
+                    video.areSizeAndRateSupported(size.width, size.height, rate.toDouble()) &&
+                    caps.isFormatSupported(format(size))
+            }
+            this.width = selected.width
+            this.height = selected.height
+            val format = format(selected)
+            if (this.width != width || this.height != height) {
+                Log.w(TAG, "$codecName fallback ${width}x$height -> ${this.width}x${this.height} @$frameRate")
+            }
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             if (useSurface) inputSurface = codec.createInputSurface()
             codec.start()
@@ -74,10 +104,10 @@ class H264HardwareEncoder(
             // e.g. a size this encoder does not support: free the codec so the caller can retry.
             try { inputSurface?.release() } catch (_: Exception) {}
             try { codec.release() } catch (_: Exception) {}
-            throw e
+            throw IllegalArgumentException("AVC $codecName ${width}x$height @$frameRate: ${e.message}", e)
         }
         thread = Thread { drainLoop() }.apply { isDaemon = true; start() }
-        Log.i(TAG, "H264HardwareEncoder started ${width}x$height @${frameRate}fps ${bitRate / 1000}kbps surface=$useSurface")
+        Log.i(TAG, "H264HardwareEncoder $codecName started ${this.width}x${this.height} @${frameRate}fps ${effectiveBitRate / 1000}kbps surface=$useSurface")
     }
 
     fun requestKeyFrame() {
@@ -673,42 +703,9 @@ class H264HardwareEncoder(
     companion object {
         private const val TAG = "H264HardwareEncoder"
 
-        /** Cached AVC encoder capabilities, queried once. Makes sizing/bitrate device-agnostic. */
-        data class Caps(val maxW: Int, val maxH: Int, val minBitrate: Int, val maxBitrate: Int)
-
-        @Volatile private var cachedCaps: Caps? = null
-
-        /** Query the device's AVC hardware encoder for its real limits (cached). */
-        fun caps(): Caps {
-            cachedCaps?.let { return it }
-            val fallback = Caps(1920, 1080, 100_000, 20_000_000)
-            val found = try {
-                MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.asSequence()
-                    .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }
-                    .mapNotNull { it.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities }
-                    .map {
-                        Caps(it.supportedWidths.upper, it.supportedHeights.upper,
-                             it.bitrateRange.lower, it.bitrateRange.upper)
-                    }
-                    // Prefer the encoder advertising the largest frame so we don't undercut HW.
-                    .maxByOrNull { it.maxW.toLong() * it.maxH }
-            } catch (e: Exception) { Log.w(TAG, "caps query failed: ${e.message}"); null }
-            val c = found ?: fallback
-            cachedCaps = c
-            Log.i(TAG, "AVC encoder caps ${c.maxW}x${c.maxH} bitrate ${c.minBitrate}..${c.maxBitrate}")
-            return c
-        }
-
-        /**
-         * Target ~0.2 bits/pixel/frame at 30fps (w*h*6) — enough to avoid visible H.264 macroblocking
-         * (the old w*h*3 ≈ 0.1 bpp looked "compressed" at 1440x1080). Clamped to the device's range.
-         */
+        /** Target bitrate; the selected codec applies its own bitrate range during configuration. */
         fun bitrateFor(w: Int, h: Int): Int = clampBitrate(w.toLong() * h * 6)
 
-        /** [bitsPerSecond] within the device encoder's supported range. */
-        fun clampBitrate(bitsPerSecond: Long): Int {
-            val c = caps()
-            return bitsPerSecond.coerceIn(c.minBitrate.toLong(), c.maxBitrate.toLong()).toInt()
-        }
+        fun clampBitrate(bitsPerSecond: Long): Int = bitsPerSecond.coerceIn(100_000L, 20_000_000L).toInt()
     }
 }

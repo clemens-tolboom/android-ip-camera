@@ -49,6 +49,9 @@ class H264StreamingEncoder(
         { runnable -> Thread(runnable, "H264NetworkWriter").apply { isDaemon = true } }
     ).apply { allowCoreThreadTimeOut(true) }
 
+    @Volatile var configurationError: String? = null
+        private set
+
     override fun processFrame(image: ImageProxy) {
         val enc = h264HardwareEncoder
         if (enc != null && enc.useSurface) {
@@ -73,6 +76,7 @@ class H264StreamingEncoder(
             if (encMutable == null || encMutable.width != outW || encMutable.height != outH) {
                 invalidatePendingWrites()
                 encMutable?.stop()
+                h264HardwareEncoder = null
                 val fps = prefs.getString("stream_fps", "30")?.toIntOrNull() ?: 30
                 val fpsCoerced = fps.coerceIn(1, 60)
                 encMutable = H264HardwareEncoder(
@@ -82,6 +86,7 @@ class H264StreamingEncoder(
                     H264HardwareEncoder.bitrateFor(outW, outH),
                     false
                 ) { d, k, pts -> broadcastH264(d, k, pts) }
+                configurationError = null
                 h264HardwareEncoder = encMutable
                 encMutable.requestKeyFrame()
                 streamingServerHelper?.resetH264Wait()
@@ -103,6 +108,7 @@ class H264StreamingEncoder(
             DeviceMemoryHelper.updateMemoryPressure(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL)
             try { System.gc() } catch (_: Exception) {}
         } catch (e: Exception) {
+            configurationError = e.message ?: e.javaClass.simpleName
             Log.e(TAG, "feed: ${e.message}")
         }
     }
@@ -264,6 +270,7 @@ class H264StreamingEncoder(
             }
         }
         h264HardwareEncoder = encoder
+        if (encoder != null) configurationError = null
     }
 
     private fun invalidatePendingWrites() {
